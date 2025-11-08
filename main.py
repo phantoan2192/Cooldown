@@ -1,122 +1,154 @@
 import discord
 from discord.ext import commands, tasks
-import asyncio
+from datetime import datetime, timedelta
 import json
-import datetime
 import os
 
-TOKEN = os.getenv("MTQzNjU2MTQwMjg2ODI2OTIyOQ.GBjARu.zzz6B1du5rV-XLIrxy0TRaG6MAN6XzIaDR5HCs")
+TOKEN = os.getenv("DISCORD_TOKEN")  # Lấy TOKEN từ Secrets
+DATA_FILE = "cooldown.json"
 
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+intents = discord.Intents.all()
+bot = commands.Bot(command_prefix="", intents=intents)  # Không cần dấu !
 
-COOLDOWN_FILE = "cooldown.json"
 
-# -----------------------------------------------------
-# Load / Save cooldown
-# -----------------------------------------------------
-
-def load_cooldown():
-    if not os.path.exists(COOLDOWN_FILE):
+# ---------------------------
+# Tải / lưu JSON
+# ---------------------------
+def load_data():
+    if not os.path.exists(DATA_FILE):
         return {}
-    with open(COOLDOWN_FILE, "r") as f:
+    with open(DATA_FILE, "r") as f:
         return json.load(f)
 
-def save_cooldown(data):
-    with open(COOLDOWN_FILE, "w") as f:
+def save_data(data):
+    with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=4)
 
-cooldowns = load_cooldown()
+cooldowns = load_data()
 
-# -----------------------------------------------------
-# Helper: tạo bar màu
-# -----------------------------------------------------
 
-def cooldown_bar(minutes_left: int):
-    if minutes_left <= 0:
-        color = "🟩"
-    elif minutes_left <= 10:
-        color = "🟨"
-    else:
-        color = "🟥"
+# ---------------------------
+# Tính thời gian còn lại
+# ---------------------------
+def remaining_minutes(end_timestamp):
+    now = datetime.now().timestamp()
+    diff = end_timestamp - now
+    return max(0, int(diff // 60))
 
-    filled = max(1, min(30, int((minutes_left / 60) * 30)))
-    empty = 30 - filled
 
-    return f"{color} |" + ("█" * filled) + ("░" * empty) + f"| {minutes_left} phút"
+# ---------------------------
+# Màu biểu đồ cooldown
+# ---------------------------
+def get_color(mins):
+    if mins == 0:
+        return "🟩"  # xanh
+    if mins <= 10:
+        return "🟨"  # vàng
+    return "🟥"  # đỏ
 
-# -----------------------------------------------------
-# Lệnh nhập số
-# -----------------------------------------------------
 
-@bot.command()
-async def set(ctx, number: int, minutes: int = 60):
-    user_id = str(ctx.author.id)
-    now = datetime.datetime.utcnow()
+# ---------------------------
+# Xử lý tin nhắn nhập số
+# ---------------------------
+@bot.event
+async def on_message(msg):
+    if msg.author.bot:
+        return
 
-    if number not in range(1, 1001):
-        return await ctx.send("Số phải nằm trong khoảng 1–1000.")
+    text = msg.content.strip()
 
-    if user_id not in cooldowns:
-        cooldowns[user_id] = {}
+    # Nếu chỉ nhập số → cooldown = 60 phút
+    if text.isdigit():
+        num = text
 
-    cooldowns[user_id][str(number)] = (now + datetime.timedelta(minutes=minutes)).timestamp()
-    save_cooldown(cooldowns)
+        now = datetime.now()
+        end = now + timedelta(minutes=60)
 
-    await ctx.send(f"✅ Đặt cooldown cho **tài khoản {number}**: **{minutes} phút**.")
+        cooldowns[num] = {
+            "start": now.timestamp(),
+            "end": end.timestamp(),
+            "user_id": msg.author.id,
+            "channel_id": msg.channel.id
+        }
+        save_data(cooldowns)
 
-# -----------------------------------------------------
-# Lệnh check
-# -----------------------------------------------------
+        await msg.channel.send(
+            f"✅ **Tài khoản {num}** đặt cooldown **60 phút**\n"
+            f"⏳ Bắt đầu lúc **{now.strftime('%H:%M:%S')}**\n"
+            f"{msg.author.mention}"
+        )
+        return
 
-@bot.command()
-async def check(ctx):
-    user_id = str(ctx.author.id)
+    # Nếu nhập dạng "1 45" → cooldown = 45 phút
+    parts = text.split()
+    if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+        num = parts[0]
+        mins = int(parts[1])
 
-    if user_id not in cooldowns or cooldowns[user_id] == {}:
-        return await ctx.send("Bạn chưa có cooldown nào.")
+        now = datetime.now()
+        end = now + timedelta(minutes=mins)
 
-    now = datetime.datetime.utcnow().timestamp()
-    text = "📊 **Biểu đồ cooldown**:\n\n"
+        cooldowns[num] = {
+            "start": now.timestamp(),
+            "end": end.timestamp(),
+            "user_id": msg.author.id,
+            "channel_id": msg.channel.id
+        }
+        save_data(cooldowns)
 
-    for number, exp in sorted(cooldowns[user_id].items(), key=lambda x: int(x[0])):
-        minutes_left = int((exp - now) / 60)
+        await msg.channel.send(
+            f"✅ **Tài khoản {num}** đặt cooldown **{mins} phút**\n"
+            f"⏳ Bắt đầu lúc **{now.strftime('%H:%M:%S')}**\n"
+            f"{msg.author.mention}"
+        )
+        return
 
-        bar = cooldown_bar(minutes_left)
-        text += f"**Tài khoản {number}** → {bar}\n"
+    # Lệnh check cooldown
+    if text == "check":
+        if not cooldowns:
+            await msg.channel.send("📭 Không có cooldown nào.")
+            return
 
-    await ctx.send(text)
+        result = "📊 **Biểu đồ Cooldown**\n\n"
+        for num, info in cooldowns.items():
+            mins = remaining_minutes(info["end"])
+            result += f"{get_color(mins)} **Tài khoản {num}** — {mins} phút còn lại\n"
 
-# -----------------------------------------------------
-# Background task: kiểm tra cooldown 1 phút/lần
-# -----------------------------------------------------
+        await msg.channel.send(result)
+        return
 
-@tasks.loop(seconds=60)
-async def cooldown_watcher():
-    await bot.wait_until_ready()
-    now = datetime.datetime.utcnow().timestamp()
 
-    for user_id, accounts in list(cooldowns.items()):
-        for number, expiry in list(accounts.items()):
-            if expiry <= now:
-                try:
-                    user = await bot.fetch_user(int(user_id))
-                    await user.send(f"✅ **Tài khoản {number} đã về 0 phút — bạn có thể bắt cóc!**")
-                except:
-                    pass
+# ---------------------------
+# Kiểm tra cooldown mỗi 10 giây
+# ---------------------------
+@tasks.loop(seconds=10)
+async def check_cd():
+    now = datetime.now().timestamp()
+    expired = []
 
-                del cooldowns[user_id][number]
-                save_cooldown(cooldowns)
+    for num, info in cooldowns.items():
+        if now >= info["end"]:
+            expired.append(num)
 
-@cooldown_watcher.before_loop
-async def before():
-    print("⏳ Bắt đầu kiểm tra cooldown...")
+            user = bot.get_user(info["user_id"])
+            channel = bot.get_channel(info["channel_id"])
 
-cooldown_watcher.start()
+            if channel and user:
+                await channel.send(
+                    f"⏰ **Tài khoản {num} đã hết cooldown!** {user.mention}"
+                )
 
-# -----------------------------------------------------
-# Bot chạy
-# -----------------------------------------------------
+    for num in expired:
+        del cooldowns[num]
+
+    if expired:
+        save_data(cooldowns)
+
+
+@bot.event
+async def on_ready():
+    print(f"✅ Bot đã chạy: {bot.user}")
+    check_cd.start()
+
 
 bot.run(TOKEN)
